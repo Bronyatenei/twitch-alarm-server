@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: twitch-alarm-relay
+  labels:
+    app: twitch-alarm-relay
+spec:
+  selector:
+    app: twitch-alarm-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: twitch-alarm-relay
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - eventsub.example.com
+      secretName: twitch-alarm-tls
+  rules:
+    - host: eventsub.example.com
+      http:
+        paths:
+          - path: /eventsub/callback
+            pathType: Prefix
+            backend:
+              service:
+                name: twitch-alarm-relay
+                port:
+                  name: http
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: twitch-alarm-relay
+                port:
+                  name: http

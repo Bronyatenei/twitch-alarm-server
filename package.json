@@ -1,0 +1,15 @@
+{
+  "name": "twitch-alarm-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0",
+    "fastify-raw-body": "^5.0.0",
+    "firebase-admin": "^13.0.0",
+    "better-sqlite3": "^11.3.0"
+  }
+}

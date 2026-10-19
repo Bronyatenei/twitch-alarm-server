@@ -1,0 +1,80 @@
+name: Build and deploy to k3s
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  NAMESPACE: twitch-alarm
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+      - name: Deploy manifests and secrets to k3s
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          EVENTSUB_CALLBACK: ${{ secrets.EVENTSUB_CALLBACK }}
+          EVENTSUB_SECRET: ${{ secrets.EVENTSUB_SECRET }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          tar czf /tmp/k8s.tgz deploy/k8s
+          scp /tmp/k8s.tgz "$SERVER_USER@$SERVER_HOST:/tmp/twitch-alarm-k8s.tgz"
+          ssh "$SERVER_USER@$SERVER_HOST" 'set -eu
+            rm -rf /tmp/twitch-alarm-k8s
+            mkdir -p /tmp/twitch-alarm-k8s
+            tar xzf /tmp/twitch-alarm-k8s.tgz -C /tmp/twitch-alarm-k8s
+            sudo k3s kubectl apply -f /tmp/twitch-alarm-k8s/deploy/k8s/namespace.yaml
+          '
+          printf '%s\n' \
+            "TWITCH_CLIENT_ID=$TWITCH_CLIENT_ID" \
+            "TWITCH_CLIENT_SECRET=$TWITCH_CLIENT_SECRET" \
+            "EVENTSUB_CALLBACK=$EVENTSUB_CALLBACK" \
+            "EVENTSUB_SECRET=$EVENTSUB_SECRET" \
+            "ADMIN_API_KEY=$ADMIN_API_KEY" \
+            > /tmp/twitch-alarm.env
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" | base64 -w0 > /tmp/firebase-service-account.b64
+          scp /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 "$SERVER_USER@$SERVER_HOST:/tmp/"
+          ssh "$SERVER_USER@$SERVER_HOST" "set -eu
+            base64 -d /tmp/firebase-service-account.b64 > /tmp/firebase-service-account.json
+            sudo k3s kubectl -n $NAMESPACE create secret generic twitch-alarm-secrets --from-env-file=/tmp/twitch-alarm.env --from-file=FIREBASE_SERVICE_ACCOUNT_JSON=/tmp/firebase-service-account.json --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+            sudo k3s kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username="$GHCR_USERNAME" --docker-password="$GHCR_PULL_TOKEN" --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+            rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json
+            sudo k3s kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
+            sudo k3s kubectl -n $NAMESPACE set image deployment/twitch-alarm-relay relay=$IMAGE:${GITHUB_SHA}
+            sudo k3s kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
+          "
