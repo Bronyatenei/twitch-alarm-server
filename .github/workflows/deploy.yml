@@ -69,13 +69,15 @@ jobs:
             "ADMIN_API_KEY=$ADMIN_API_KEY" \
             > /tmp/twitch-alarm.env
           printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" | base64 -w0 > /tmp/firebase-service-account.b64
-          scp /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 "$SERVER_USER@$SERVER_HOST:/tmp/"
+          printf '{"data":{"FIREBASE_SERVICE_ACCOUNT_JSON":"%s"}}\n' "$(cat /tmp/firebase-service-account.b64)" > /tmp/firebase-secret-patch.json
+          scp /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-secret-patch.json "$SERVER_USER@$SERVER_HOST:/tmp/"
           ssh "$SERVER_USER@$SERVER_HOST" "set -eu
             base64 -d /tmp/firebase-service-account.b64 > /tmp/firebase-service-account.json
             export KUBECONFIG=\"\$HOME/.kube/config\"
-            kubectl -n $NAMESPACE create secret generic twitch-alarm-secrets --from-env-file=/tmp/twitch-alarm.env --from-file=FIREBASE_SERVICE_ACCOUNT_JSON=/tmp/firebase-service-account.json --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n $NAMESPACE create secret generic twitch-alarm-secrets --from-env-file=/tmp/twitch-alarm.env --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n $NAMESPACE patch secret twitch-alarm-secrets --type=merge --patch-file=/tmp/firebase-secret-patch.json
             kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username=\"$GHCR_USERNAME\" --docker-password=\"$GHCR_PULL_TOKEN\" --dry-run=client -o yaml | kubectl apply -f -
-            rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json
+            rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json /tmp/firebase-secret-patch.json
             kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
             kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
           "
