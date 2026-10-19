@@ -22,10 +22,10 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - eventsub.example.com
+        - bronyatenei.site
       secretName: twitch-alarm-tls
   rules:
-    - host: eventsub.example.com
+    - host: bronyatenei.site
       http:
         paths:
           - path: /eventsub/callback

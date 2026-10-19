@@ -29,7 +29,7 @@ Do not commit any of these values or a Firebase JSON file.
 
 The server must already have k3s, an SSH account, and a public DNS name pointing to the server. The k3s Traefik ingress must be reachable on ports 80 and 443. The included Ingress expects cert-manager with a `letsencrypt-prod` ClusterIssuer; alternatively replace the TLS section with a certificate managed by your existing ingress setup.
 
-Before the first deployment, change `eventsub.example.com` in `deploy/k8s/service-ingress.yaml` to the real hostname and set the same URL in `EVENTSUB_CALLBACK`.
+The current Ingress is configured for `bronyatenei.site`. Set the same URL in `EVENTSUB_CALLBACK`.
 
 The GitHub Actions workflow builds the image, pushes it to GHCR, copies the manifests to the server, creates/updates the Kubernetes Secret, and waits for the rollout.
 
