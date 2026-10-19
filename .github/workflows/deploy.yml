@@ -58,7 +58,8 @@ jobs:
             rm -rf /tmp/twitch-alarm-k8s
             mkdir -p /tmp/twitch-alarm-k8s
             tar xzf /tmp/twitch-alarm-k8s.tgz -C /tmp/twitch-alarm-k8s
-            sudo k3s kubectl apply -f /tmp/twitch-alarm-k8s/deploy/k8s/namespace.yaml
+            export KUBECONFIG="$HOME/.kube/config"
+            kubectl apply -f /tmp/twitch-alarm-k8s/deploy/k8s/namespace.yaml
           '
           printf '%s\n' \
             "TWITCH_CLIENT_ID=$TWITCH_CLIENT_ID" \
@@ -71,9 +72,10 @@ jobs:
           scp /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 "$SERVER_USER@$SERVER_HOST:/tmp/"
           ssh "$SERVER_USER@$SERVER_HOST" "set -eu
             base64 -d /tmp/firebase-service-account.b64 > /tmp/firebase-service-account.json
-            sudo k3s kubectl -n $NAMESPACE create secret generic twitch-alarm-secrets --from-env-file=/tmp/twitch-alarm.env --from-file=FIREBASE_SERVICE_ACCOUNT_JSON=/tmp/firebase-service-account.json --dry-run=client -o yaml | sudo k3s kubectl apply -f -
-            sudo k3s kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username="$GHCR_USERNAME" --docker-password="$GHCR_PULL_TOKEN" --dry-run=client -o yaml | sudo k3s kubectl apply -f -
+            export KUBECONFIG=\"\$HOME/.kube/config\"
+            kubectl -n $NAMESPACE create secret generic twitch-alarm-secrets --from-env-file=/tmp/twitch-alarm.env --from-file=FIREBASE_SERVICE_ACCOUNT_JSON=/tmp/firebase-service-account.json --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username=\"$GHCR_USERNAME\" --docker-password=\"$GHCR_PULL_TOKEN\" --dry-run=client -o yaml | kubectl apply -f -
             rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json
-            sudo k3s kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
-            sudo k3s kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
+            kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
+            kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
           "
