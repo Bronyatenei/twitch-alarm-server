@@ -16,12 +16,19 @@ spec:
       labels:
         app: twitch-alarm-relay
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       imagePullSecrets:
         - name: ghcr-pull-secret
       containers:
         - name: relay
-          image: ghcr.io/bronyatenei/twitch-alarm-server:latest
-          imagePullPolicy: Always
+          image: ghcr.io/bronyatenei/twitch-alarm-server:IMAGE_TAG_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080

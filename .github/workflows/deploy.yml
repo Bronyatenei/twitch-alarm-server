@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE: ghcr.io/bronyatenei/twitch-alarm-server
   NAMESPACE: twitch-alarm
 
 jobs:
@@ -30,7 +30,6 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
       - name: Configure SSH
         uses: webfactory/ssh-agent@v0.9.0
@@ -52,6 +51,7 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
           ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${GITHUB_SHA}|g" deploy/k8s/deployment.yaml
           tar czf /tmp/k8s.tgz deploy/k8s
           scp /tmp/k8s.tgz "$SERVER_USER@$SERVER_HOST:/tmp/twitch-alarm-k8s.tgz"
           ssh "$SERVER_USER@$SERVER_HOST" 'set -eu
@@ -75,6 +75,5 @@ jobs:
             sudo k3s kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username="$GHCR_USERNAME" --docker-password="$GHCR_PULL_TOKEN" --dry-run=client -o yaml | sudo k3s kubectl apply -f -
             rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json
             sudo k3s kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
-            sudo k3s kubectl -n $NAMESPACE set image deployment/twitch-alarm-relay relay=$IMAGE:${GITHUB_SHA}
             sudo k3s kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
           "
