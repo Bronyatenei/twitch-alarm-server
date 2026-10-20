@@ -29,6 +29,12 @@ spec:
         - name: relay
           image: ghcr.io/bronyatenei/twitch-alarm-server:IMAGE_TAG_PLACEHOLDER
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
