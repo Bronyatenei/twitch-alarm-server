@@ -42,3 +42,10 @@ spec:
                 name: twitch-alarm-relay
                 port:
                   name: http
+          - path: /v1/watchlists
+            pathType: Prefix
+            backend:
+              service:
+                name: twitch-alarm-relay
+                port:
+                  name: http
