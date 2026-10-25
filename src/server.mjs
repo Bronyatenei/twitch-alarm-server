@@ -91,6 +91,38 @@ async function authenticateWatchlistRequest(request, reply, body) {
   return { ownerId, responseOwnerId: ownerId, uid: null, displayName: null };
 }
 
+function deleteOwnerData(ownerId) {
+  const remove = db.transaction(() => {
+    const watches = db.prepare('DELETE FROM watches WHERE owner_id = ?').run(ownerId).changes;
+    const devices = db.prepare('DELETE FROM devices WHERE owner_id = ?').run(ownerId).changes;
+    const profiles = db.prepare('DELETE FROM profiles WHERE owner_id = ?').run(ownerId).changes;
+    return { watches, devices, profiles, total: watches + devices + profiles };
+  });
+  return remove();
+}
+async function authenticateFirebaseUid(request, reply) {
+  const authorization = request.headers.authorization;
+  if (typeof authorization !== 'string' || !authorization.toLowerCase().startsWith('bearer ')) {
+    reply.code(401).send({ error: 'unauthorized' });
+    return null;
+  }
+  if (!admin.apps.length) {
+    reply.code(503).send({ error: 'auth_unavailable' });
+    return null;
+  }
+  const token = authorization.slice(7).trim();
+  if (!token) {
+    reply.code(401).send({ error: 'unauthorized' });
+    return null;
+  }
+  try {
+    return await admin.auth().verifyIdToken(token);
+  } catch (error) {
+    request.log.warn({ code: error?.code }, 'Firebase ID token verification failed');
+    reply.code(401).send({ error: 'unauthorized' });
+    return null;
+  }
+}
 async function twitchToken() {
   const body = new URLSearchParams({ client_id: TWITCH_CLIENT_ID, client_secret: TWITCH_CLIENT_SECRET, grant_type: 'client_credentials' });
   const response = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body });
@@ -146,15 +178,37 @@ app.post('/eventsub/callback', { config: { rawBody: true } }, async (request, re
 
 async function dispatchStreamOnline(event, log) {
   const rows = db.prepare('SELECT owner_id, notification_only FROM watches WHERE user_id = ? AND enabled = 1').all(event.broadcaster_user_id);
+  const tokenModes = new Map();
   for (const row of rows) {
+    const notificationOnly = Boolean(row.notification_only);
     const tokens = db.prepare('SELECT fcm_token FROM devices WHERE owner_id = ?').all(row.owner_id).map(x => x.fcm_token);
-    if (!tokens.length || !admin.apps.length) continue;
-    const message = { data: { type: 'stream_start', streamer: event.broadcaster_user_login, streamer_name: event.broadcaster_user_name, stream_id: event.id, started_at: event.started_at, notification_only: row.notification_only ? 'true' : 'false' }, tokens };
+    for (const token of tokens) {
+      // false (alarm-enabled) wins if the same token is registered by multiple owners.
+      tokenModes.set(token, tokenModes.has(token) ? (tokenModes.get(token) && notificationOnly) : notificationOnly);
+    }
+  }
+  if (!tokenModes.size || !admin.apps.length) return;
+  for (const notificationOnly of [false, true]) {
+    const tokens = [...tokenModes].filter(([, mode]) => mode === notificationOnly).map(([token]) => token);
+    if (!tokens.length) continue;
+    const message = { data: { type: 'stream_start', streamer: event.broadcaster_user_login, streamer_name: event.broadcaster_user_name, stream_id: event.id, started_at: event.started_at, notification_only: notificationOnly ? 'true' : 'false' }, tokens };
     const result = await admin.messaging().sendEachForMulticast(message);
-    log.info({ ownerId: row.owner_id, success: result.successCount, failure: result.failureCount }, 'FCM stream event sent');
+    log.info({ success: result.successCount, failure: result.failureCount, notificationOnly }, 'FCM stream event sent');
   }
 }
 
+app.delete('/v1/watchlists/self', async (request, reply) => {
+  const decoded = await authenticateFirebaseUid(request, reply);
+  if (!decoded) return;
+  deleteOwnerData(decoded.uid);
+  return { deleted: true, uid: decoded.uid };
+});
+app.delete('/v1/watchlists/:ownerId', async (request, reply) => {
+  if (!requireApiKey(request, reply)) return;
+  const ownerId = typeof request.params.ownerId === 'string' ? request.params.ownerId.trim() : '';
+  if (!ownerId) return reply.code(400).send({ error: 'ownerId is required' });
+  return { deleted: deleteOwnerData(ownerId).total, ownerId };
+});
 app.post('/v1/watchlists', async (request, reply) => {
   const body = request.body || {};
   const auth = await authenticateWatchlistRequest(request, reply, body);
