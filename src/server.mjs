@@ -1,5 +1,4 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import Fastify from 'fastify';
 import rawBody from 'fastify-raw-body';
 import Database from 'better-sqlite3';
@@ -28,6 +27,10 @@ db.exec(`
     fcm_token TEXT NOT NULL,
     PRIMARY KEY (owner_id, fcm_token)
   );
+  CREATE TABLE IF NOT EXISTS profiles (
+    owner_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS processed_events (
     message_id TEXT PRIMARY KEY,
     received_at INTEGER NOT NULL
@@ -51,6 +54,41 @@ function requireApiKey(request, reply) {
     return false;
   }
   return true;
+}
+
+async function authenticateWatchlistRequest(request, reply, body) {
+  const authorization = request.headers.authorization;
+  if (typeof authorization === 'string' && authorization.toLowerCase().startsWith('bearer ')) {
+    if (!admin.apps.length) {
+      reply.code(503).send({ error: 'auth_unavailable' });
+      return null;
+    }
+    const token = authorization.slice(7).trim();
+    if (!token) {
+      reply.code(401).send({ error: 'unauthorized' });
+      return null;
+    }
+    try {
+      const decoded = await admin.auth().verifyIdToken(token);
+      const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : '';
+      if (!displayName || displayName.length > 40) {
+        reply.code(400).send({ error: 'displayName must be 1..40 characters' });
+        return null;
+      }
+      return { ownerId: decoded.uid, responseOwnerId: displayName, uid: decoded.uid, displayName };
+    } catch (error) {
+      request.log.warn({ code: error?.code }, 'Firebase ID token verification failed');
+      reply.code(401).send({ error: 'unauthorized' });
+      return null;
+    }
+  }
+  if (!requireApiKey(request, reply)) return null;
+  const ownerId = typeof body.ownerId === 'string' ? body.ownerId.trim() : '';
+  if (!ownerId) {
+    reply.code(400).send({ error: 'ownerId is required' });
+    return null;
+  }
+  return { ownerId, responseOwnerId: ownerId, uid: null, displayName: null };
 }
 
 async function twitchToken() {
@@ -118,14 +156,42 @@ async function dispatchStreamOnline(event, log) {
 }
 
 app.post('/v1/watchlists', async (request, reply) => {
-  if (!requireApiKey(request, reply)) return;
-  const { ownerId, fcmToken, channels = [] } = request.body || {};
-  if (!ownerId || !fcmToken || !Array.isArray(channels) || channels.length > 100) return reply.code(400).send({ error: 'ownerId, fcmToken and up to 100 channels are required' });
-  db.prepare('INSERT OR IGNORE INTO devices (owner_id, fcm_token) VALUES (?, ?)').run(ownerId, fcmToken);
-  const resolve = await twitch('/users?login=' + channels.map(x => encodeURIComponent(String(x).replace(/^@/, '').toLowerCase())).join('&login='));
-  const insert = db.prepare('INSERT OR REPLACE INTO watches (owner_id, login, user_id, enabled, notification_only) VALUES (?, ?, ?, 1, 0)');
-  for (const user of resolve.data || []) { insert.run(ownerId, user.login, user.id); await ensureSubscription(user.id); }
-  return { ownerId, channels: resolve.data?.map(x => x.login) || [] };
+  const body = request.body || {};
+  const auth = await authenticateWatchlistRequest(request, reply, body);
+  if (!auth) return;
+  const { fcmToken, channels = [] } = body;
+  if (typeof fcmToken !== 'string' || !fcmToken.trim() || !Array.isArray(channels) || channels.length > 100) {
+    return reply.code(400).send({ error: 'fcmToken and up to 100 channels are required' });
+  }
+  const normalizedChannels = [...new Set(channels.map(channel => typeof channel === 'string' ? channel.trim().replace(/^@/, '').toLowerCase() : ''))];
+  if (normalizedChannels.some(channel => !/^[a-z0-9_]{1,25}$/.test(channel))) {
+    return reply.code(400).send({ error: 'channels must contain valid Twitch logins' });
+  }
+  let resolvedUsers = [];
+  try {
+    if (normalizedChannels.length) {
+      const resolve = await twitch('/users?login=' + normalizedChannels.map(channel => encodeURIComponent(channel)).join('&login='));
+      resolvedUsers = resolve.data || [];
+      for (const user of resolvedUsers) await ensureSubscription(user.id);
+    }
+  } catch (error) {
+    request.log.error({ err: error }, 'Twitch watchlist sync failed');
+    return reply.code(502).send({ error: 'twitch_unavailable' });
+  }
+
+  const sync = db.transaction(() => {
+    if (auth.displayName) {
+      db.prepare('INSERT INTO profiles (owner_id, display_name) VALUES (?, ?) ON CONFLICT(owner_id) DO UPDATE SET display_name = excluded.display_name').run(auth.ownerId, auth.displayName);
+    }
+    db.prepare('INSERT OR IGNORE INTO devices (owner_id, fcm_token) VALUES (?, ?)').run(auth.ownerId, fcmToken.trim());
+    const resolvedIds = new Set(resolvedUsers.map(user => user.id));
+    const deleteMissing = db.prepare('DELETE FROM watches WHERE owner_id = ? AND user_id NOT IN (' + (resolvedIds.size ? [...resolvedIds].map(() => '?').join(',') : "SELECT ''") + ')');
+    deleteMissing.run(auth.ownerId, ...resolvedIds);
+    const insert = db.prepare('INSERT OR REPLACE INTO watches (owner_id, login, user_id, enabled, notification_only) VALUES (?, ?, ?, 1, 0)');
+    for (const user of resolvedUsers) insert.run(auth.ownerId, user.login, user.id);
+  });
+  sync();
+  return { ownerId: auth.responseOwnerId, uid: auth.uid, channels: resolvedUsers.map(user => user.login) };
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => app.log.info({ port: PORT }, 'server started')).catch(error => { app.log.error(error); process.exit(1); });
