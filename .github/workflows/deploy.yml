@@ -79,5 +79,19 @@ jobs:
             kubectl -n $NAMESPACE create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username=\"$GHCR_USERNAME\" --docker-password=\"$GHCR_PULL_TOKEN\" --dry-run=client -o yaml | kubectl apply -f -
             rm -f /tmp/twitch-alarm.env /tmp/firebase-service-account.b64 /tmp/firebase-service-account.json /tmp/firebase-secret-patch.json
             kubectl -n $NAMESPACE apply -k /tmp/twitch-alarm-k8s/deploy/k8s
-            kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s
+            if ! kubectl -n $NAMESPACE rollout status deployment/twitch-alarm-relay --timeout=180s; then
+              echo "=== pods ==="
+              kubectl -n $NAMESPACE get pods -o wide || true
+              echo "=== deployment ==="
+              kubectl -n $NAMESPACE describe deployment twitch-alarm-relay || true
+              echo "=== pod descriptions ==="
+              kubectl -n $NAMESPACE describe pods -l app=twitch-alarm-relay || true
+              echo "=== recent events ==="
+              kubectl -n $NAMESPACE get events --sort-by=.lastTimestamp | tail -100 || true
+              echo "=== container logs ==="
+              kubectl -n $NAMESPACE logs -l app=twitch-alarm-relay --all-containers --tail=200 --prefix || true
+              echo "=== previous container logs ==="
+              kubectl -n $NAMESPACE logs -l app=twitch-alarm-relay --all-containers --previous --tail=200 --prefix || true
+              exit 1
+            fi
           "
