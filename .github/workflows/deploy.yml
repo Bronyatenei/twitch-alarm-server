@@ -35,6 +35,39 @@ jobs:
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+      - name: Snapshot server load before deployment
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          ssh "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+            set +e
+            echo "=== time / uptime ==="
+            date -Is
+            uptime
+            echo "=== memory / disk ==="
+            free -h
+            df -h /
+            echo "=== load snapshot ==="
+            top -b -n 1 -o %CPU | head -35
+            echo "=== top processes by cpu ==="
+            ps -eo pid,ppid,user,stat,pcpu,pmem,etime,comm,args --sort=-pcpu | head -35
+            echo "=== k3s pod resource usage ==="
+            export KUBECONFIG="${HOME}/.kube/config"
+            kubectl top pods -A --sort-by=cpu 2>&1 || true
+            echo "=== k3s node resource usage ==="
+            kubectl top nodes 2>&1 || true
+            echo "=== all pods and restarts ==="
+            kubectl get pods -A -o wide 2>&1 || true
+            echo "=== relay pod status ==="
+            kubectl -n twitch-alarm get pod -l app=twitch-alarm-relay -o wide 2>&1 || true
+            echo "=== recent cluster events ==="
+            kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -100 || true
+          REMOTE
+
       - name: Deploy manifests and secrets to k3s
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
