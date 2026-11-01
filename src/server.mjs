@@ -37,9 +37,15 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS subscriptions (
     user_id TEXT PRIMARY KEY,
-    twitch_subscription_id TEXT NOT NULL
+    twitch_subscription_id TEXT,
+    offline_subscription_id TEXT
   );
 `);
+
+const subscriptionColumns = db.prepare('PRAGMA table_info(subscriptions)').all().map(column => column.name);
+if (!subscriptionColumns.includes('offline_subscription_id')) {
+  db.exec('ALTER TABLE subscriptions ADD COLUMN offline_subscription_id TEXT');
+}
 
 if (!admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)) });
@@ -140,15 +146,17 @@ async function twitch(path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
-async function ensureSubscription(userId) {
-  if (db.prepare('SELECT 1 FROM subscriptions WHERE user_id = ?').get(userId)) return;
+async function ensureSubscription(userId, type) {
+  const column = type === 'stream.offline' ? 'offline_subscription_id' : 'twitch_subscription_id';
+  const existing = db.prepare(`SELECT ${column} AS subscription_id FROM subscriptions WHERE user_id = ?`).get(userId);
+  if (existing?.subscription_id) return;
   const result = await twitch('/eventsub/subscriptions', {
     method: 'POST',
-    body: JSON.stringify({ type: 'stream.online', version: '1', condition: { broadcaster_user_id: userId }, transport: { method: 'webhook', callback: EVENTSUB_CALLBACK, secret: EVENTSUB_SECRET } })
+    body: JSON.stringify({ type, version: '1', condition: { broadcaster_user_id: userId }, transport: { method: 'webhook', callback: EVENTSUB_CALLBACK, secret: EVENTSUB_SECRET } })
   });
   const subscription = result.data?.[0];
-  if (!subscription) throw new Error('Twitch did not return an EventSub subscription');
-  db.prepare('INSERT OR REPLACE INTO subscriptions (user_id, twitch_subscription_id) VALUES (?, ?)').run(userId, subscription.id);
+  if (!subscription) throw new Error(`Twitch did not return an EventSub ${type} subscription`);
+  db.prepare(`INSERT INTO subscriptions (user_id, ${column}) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}`).run(userId, subscription.id);
 }
 
 function validSignature(request) {
@@ -173,27 +181,41 @@ app.post('/eventsub/callback', { config: { rawBody: true } }, async (request, re
   if (type === 'webhook_callback_verification') return reply.type('text/plain').send(body.challenge);
   if (type === 'revocation') request.log.warn({ body }, 'EventSub subscription revoked');
   if (type === 'notification' && body.subscription?.type === 'stream.online') await dispatchStreamOnline(body.event, request.log);
+  if (type === 'notification' && body.subscription?.type === 'stream.offline') await dispatchStreamOffline(body.event, request.log);
   return reply.code(204).send();
 });
 
 async function dispatchStreamOnline(event, log) {
+  await dispatchStreamEvent('stream_start', event, log);
+}
+
+async function dispatchStreamOffline(event, log) {
+  await dispatchStreamEvent('stream_offline', event, log);
+}
+
+async function dispatchStreamEvent(type, event, log) {
   const rows = db.prepare('SELECT owner_id, notification_only FROM watches WHERE user_id = ? AND enabled = 1').all(event.broadcaster_user_id);
   const tokenModes = new Map();
   for (const row of rows) {
     const notificationOnly = Boolean(row.notification_only);
     const tokens = db.prepare('SELECT fcm_token FROM devices WHERE owner_id = ?').all(row.owner_id).map(x => x.fcm_token);
-    for (const token of tokens) {
-      // false (alarm-enabled) wins if the same token is registered by multiple owners.
-      tokenModes.set(token, tokenModes.has(token) ? (tokenModes.get(token) && notificationOnly) : notificationOnly);
-    }
+    for (const token of tokens) tokenModes.set(token, tokenModes.has(token) ? (tokenModes.get(token) && notificationOnly) : notificationOnly);
   }
   if (!tokenModes.size || !admin.apps.length) return;
   for (const notificationOnly of [false, true]) {
     const tokens = [...tokenModes].filter(([, mode]) => mode === notificationOnly).map(([token]) => token);
     if (!tokens.length) continue;
-    const message = { data: { type: 'stream_start', streamer: event.broadcaster_user_login, streamer_name: event.broadcaster_user_name, stream_id: event.id, started_at: event.started_at, notification_only: notificationOnly ? 'true' : 'false' }, tokens };
-    const result = await admin.messaging().sendEachForMulticast(message);
-    log.info({ success: result.successCount, failure: result.failureCount, notificationOnly }, 'FCM stream event sent');
+    const data = {
+      type,
+      streamer: event.broadcaster_user_login,
+      streamer_name: event.broadcaster_user_name,
+      stream_id: event.id || '',
+      event_id: event.id || '',
+      started_at: event.started_at || '',
+      notification_only: notificationOnly ? 'true' : 'false'
+    };
+    const result = await admin.messaging().sendEachForMulticast({ data, tokens });
+    log.info({ success: result.successCount, failure: result.failureCount, type, notificationOnly }, 'FCM stream event sent');
   }
 }
 
@@ -226,7 +248,10 @@ app.post('/v1/watchlists', async (request, reply) => {
     if (normalizedChannels.length) {
       const resolve = await twitch('/users?login=' + normalizedChannels.map(channel => encodeURIComponent(channel)).join('&login='));
       resolvedUsers = resolve.data || [];
-      for (const user of resolvedUsers) await ensureSubscription(user.id);
+      for (const user of resolvedUsers) {
+        await ensureSubscription(user.id, 'stream.online');
+        await ensureSubscription(user.id, 'stream.offline');
+      }
     }
   } catch (error) {
     request.log.error({ err: error }, 'Twitch watchlist sync failed');
@@ -245,7 +270,14 @@ app.post('/v1/watchlists', async (request, reply) => {
     for (const user of resolvedUsers) insert.run(auth.ownerId, user.login, user.id);
   });
   sync();
-  return { ownerId: auth.responseOwnerId, uid: auth.uid, channels: resolvedUsers.map(user => user.login) };
+  const resolvedChannels = resolvedUsers.map(user => user.login);
+  return {
+    ownerId: auth.responseOwnerId,
+    uid: auth.uid,
+    channels: resolvedChannels,
+    requestedChannels: normalizedChannels,
+    missingChannels: normalizedChannels.filter(channel => !resolvedChannels.includes(channel))
+  };
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => app.log.info({ port: PORT }, 'server started')).catch(error => { app.log.error(error); process.exit(1); });
