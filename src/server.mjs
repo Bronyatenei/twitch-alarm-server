@@ -152,7 +152,15 @@ async function ensureSubscription(userId, type) {
   if (existing?.subscription_id) return;
 
   const saveSubscription = (subscriptionId) => {
-    db.prepare(`INSERT INTO subscriptions (user_id, ${column}) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}`).run(userId, subscriptionId);
+    const updated = db.prepare(`UPDATE subscriptions SET ${column} = ? WHERE user_id = ?`).run(subscriptionId, userId);
+    if (updated.changes > 0) return;
+    if (column === 'twitch_subscription_id') {
+      db.prepare('INSERT INTO subscriptions (user_id, twitch_subscription_id) VALUES (?, ?)').run(userId, subscriptionId);
+      return;
+    }
+    // The online subscription is created first and satisfies the legacy
+    // NOT NULL constraint on twitch_subscription_id for a new row.
+    throw new Error(`Cannot save ${type} EventSub subscription before stream.online subscription`);
   };
 
   try {
