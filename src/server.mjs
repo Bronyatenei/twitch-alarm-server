@@ -175,9 +175,12 @@ async function ensureSubscription(userId, type) {
     // The local SQLite database may have been recreated while Twitch retained
     // the subscription. Reconcile that state instead of failing watchlist sync.
     if (!String(error?.message || '').includes('HTTP 409')) throw error;
-    const result = await twitch(`/eventsub/subscriptions?user_id=${encodeURIComponent(userId)}&type=${encodeURIComponent(type)}`);
+    // Twitch allows only one query filter on this endpoint. Fetch this
+    // broadcaster's subscriptions and filter by type locally below.
+    const result = await twitch(`/eventsub/subscriptions?user_id=${encodeURIComponent(userId)}`);
     const subscription = (result.data || []).find(item =>
       item.status === 'enabled' &&
+      item.type === type &&
       item.condition?.broadcaster_user_id === userId &&
       item.transport?.method === 'webhook' &&
       item.transport?.callback === EVENTSUB_CALLBACK
