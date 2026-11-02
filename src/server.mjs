@@ -150,13 +150,33 @@ async function ensureSubscription(userId, type) {
   const column = type === 'stream.offline' ? 'offline_subscription_id' : 'twitch_subscription_id';
   const existing = db.prepare(`SELECT ${column} AS subscription_id FROM subscriptions WHERE user_id = ?`).get(userId);
   if (existing?.subscription_id) return;
-  const result = await twitch('/eventsub/subscriptions', {
-    method: 'POST',
-    body: JSON.stringify({ type, version: '1', condition: { broadcaster_user_id: userId }, transport: { method: 'webhook', callback: EVENTSUB_CALLBACK, secret: EVENTSUB_SECRET } })
-  });
-  const subscription = result.data?.[0];
-  if (!subscription) throw new Error(`Twitch did not return an EventSub ${type} subscription`);
-  db.prepare(`INSERT INTO subscriptions (user_id, ${column}) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}`).run(userId, subscription.id);
+
+  const saveSubscription = (subscriptionId) => {
+    db.prepare(`INSERT INTO subscriptions (user_id, ${column}) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}`).run(userId, subscriptionId);
+  };
+
+  try {
+    const result = await twitch('/eventsub/subscriptions', {
+      method: 'POST',
+      body: JSON.stringify({ type, version: '1', condition: { broadcaster_user_id: userId }, transport: { method: 'webhook', callback: EVENTSUB_CALLBACK, secret: EVENTSUB_SECRET } })
+    });
+    const subscription = result.data?.[0];
+    if (!subscription) throw new Error(`Twitch did not return an EventSub ${type} subscription`);
+    saveSubscription(subscription.id);
+  } catch (error) {
+    // The local SQLite database may have been recreated while Twitch retained
+    // the subscription. Reconcile that state instead of failing watchlist sync.
+    if (!String(error?.message || '').includes('HTTP 409')) throw error;
+    const result = await twitch(`/eventsub/subscriptions?user_id=${encodeURIComponent(userId)}&type=${encodeURIComponent(type)}`);
+    const subscription = (result.data || []).find(item =>
+      item.status === 'enabled' &&
+      item.condition?.broadcaster_user_id === userId &&
+      item.transport?.method === 'webhook' &&
+      item.transport?.callback === EVENTSUB_CALLBACK
+    );
+    if (!subscription) throw error;
+    saveSubscription(subscription.id);
+  }
 }
 
 function validSignature(request) {
