@@ -11,6 +11,7 @@ const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID || '';
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || '';
 const EVENTSUB_CALLBACK = process.env.EVENTSUB_CALLBACK || '';
 const EVENTSUB_SECRET = process.env.EVENTSUB_SECRET || '';
+const DESKTOP_EVENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -40,6 +41,22 @@ db.exec(`
     twitch_subscription_id TEXT,
     offline_subscription_id TEXT
   );
+  CREATE TABLE IF NOT EXISTS desktop_agents (
+    agent_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS desktop_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(owner_id, event_id)
+  );
 `);
 
 const subscriptionColumns = db.prepare('PRAGMA table_info(subscriptions)').all().map(column => column.name);
@@ -53,6 +70,33 @@ if (!admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 
 const app = Fastify({ logger: true });
 await app.register(rawBody, { field: 'rawBody', global: false, encoding: false, runFirst: true });
+
+const desktopClients = new Map();
+const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
+const newDesktopToken = () => `ta_${crypto.randomBytes(32).toString('base64url')}`;
+
+function desktopAgentFromRequest(request) {
+  const authorization = request.headers.authorization;
+  if (typeof authorization !== 'string' || !authorization.toLowerCase().startsWith('bearer ')) return null;
+  const tokenHash = hashToken(authorization.slice(7).trim());
+  return db.prepare('SELECT agent_id, owner_id, name FROM desktop_agents WHERE token_hash = ?').get(tokenHash) || null;
+}
+
+function sendDesktopEvent(ownerId, eventId, payload) {
+  const now = Date.now();
+  db.prepare('INSERT OR IGNORE INTO desktop_events (owner_id, event_id, payload, created_at) VALUES (?, ?, ?, ?)').run(ownerId, eventId, JSON.stringify(payload), now);
+  const stored = db.prepare('SELECT sequence FROM desktop_events WHERE owner_id = ? AND event_id = ?').get(ownerId, eventId);
+  for (const client of desktopClients.values()) {
+    if (client.ownerId !== ownerId) continue;
+    client.response.raw.write(`id: ${stored.sequence}\nevent: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`);
+  }
+  db.prepare('DELETE FROM desktop_events WHERE created_at < ?').run(now - DESKTOP_EVENT_RETENTION_MS);
+}
+
+async function authenticateDesktopOwner(request, reply) {
+  const decoded = await authenticateFirebaseUid(request, reply);
+  return decoded?.uid || null;
+}
 
 function requireApiKey(request, reply) {
   if (!API_KEY || request.headers['x-api-key'] !== API_KEY) {
@@ -202,6 +246,50 @@ function validSignature(request) {
 
 app.get('/healthz', async () => ({ ok: true, service: 'twitch-alarm-server' }));
 
+app.post('/v1/desktop/agents', async (request, reply) => {
+  const ownerId = await authenticateDesktopOwner(request, reply);
+  if (!ownerId) return;
+  const name = typeof request.body?.name === 'string' ? request.body.name.trim() : '';
+  if (!name || name.length > 80) return reply.code(400).send({ error: 'name must be 1..80 characters' });
+  const token = newDesktopToken();
+  const agentId = crypto.randomUUID();
+  db.prepare('INSERT INTO desktop_agents (agent_id, owner_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(agentId, ownerId, name, hashToken(token), Date.now());
+  return { agentId, name, token };
+});
+
+app.delete('/v1/desktop/agents/:agentId', async (request, reply) => {
+  const ownerId = await authenticateDesktopOwner(request, reply);
+  if (!ownerId) return;
+  const result = db.prepare('DELETE FROM desktop_agents WHERE agent_id = ? AND owner_id = ?').run(request.params.agentId, ownerId);
+  return { deleted: result.changes > 0 };
+});
+
+app.get('/v1/desktop/events', async (request, reply) => {
+  const agent = desktopAgentFromRequest(request);
+  if (!agent) return reply.code(401).send({ error: 'unauthorized' });
+  const lastEventId = Number(request.headers['last-event-id'] || request.query?.lastEventId || 0);
+  const response = reply.raw;
+  response.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no'
+  });
+  response.write(': connected\n\n');
+  db.prepare('UPDATE desktop_agents SET last_seen_at = ? WHERE agent_id = ?').run(Date.now(), agent.agent_id);
+  for (const row of db.prepare('SELECT sequence, payload FROM desktop_events WHERE owner_id = ? AND sequence > ? ORDER BY sequence ASC').all(agent.owner_id, lastEventId)) {
+    response.write(`id: ${row.sequence}\ndata: ${row.payload}\n\n`);
+  }
+  const clientKey = `${agent.agent_id}:${crypto.randomUUID()}`;
+  desktopClients.set(clientKey, { ownerId: agent.owner_id, response });
+  const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 25_000);
+  request.raw.on('close', () => {
+    clearInterval(heartbeat);
+    desktopClients.delete(clientKey);
+  });
+});
+
 app.post('/eventsub/callback', { config: { rawBody: true } }, async (request, reply) => {
   if (!validSignature(request)) return reply.code(403).send({ error: 'invalid signature' });
   const type = request.headers['twitch-eventsub-message-type'];
@@ -226,8 +314,17 @@ async function dispatchStreamOffline(event, log) {
 
 async function dispatchStreamEvent(type, event, log) {
   const rows = db.prepare('SELECT owner_id, notification_only FROM watches WHERE user_id = ? AND enabled = 1').all(event.broadcaster_user_id);
+  const desktopPayload = {
+    type: type === 'stream_start' ? 'stream_online' : type,
+    event_id: `${type}:${event.id || event.broadcaster_user_id}`,
+    stream_id: event.id || '',
+    streamer: event.broadcaster_user_login,
+    streamer_name: event.broadcaster_user_name,
+    started_at: event.started_at || ''
+  };
   const tokenModes = new Map();
   for (const row of rows) {
+    sendDesktopEvent(row.owner_id, desktopPayload.event_id, desktopPayload);
     const notificationOnly = Boolean(row.notification_only);
     const tokens = db.prepare('SELECT fcm_token FROM devices WHERE owner_id = ?').all(row.owner_id).map(x => x.fcm_token);
     for (const token of tokens) tokenModes.set(token, tokenModes.has(token) ? (tokenModes.get(token) && notificationOnly) : notificationOnly);
